@@ -1,6 +1,6 @@
 # Attribution design proposal
 
-*Companion notebook: `attribution.ipynb` (runs end-to-end from a clean kernel). Shared pipeline: `attribution_lib.py`. All numbers below are produced by that notebook, not asserted.*
+*Companion notebook: `attribution.ipynb` (runs end-to-end from a clean kernel). Shared pipeline: `attribution_lib.py`. The notebook produces the headline results below; statements identified as development-time checks come from separate exploratory runs.*
 
 ## Problem framing
 
@@ -16,7 +16,7 @@ The ML problem is **multi-label binary classification**. For each cause `c` the 
 
 $$P(Y_c=1 \mid X,\; \text{Task 1 flagged})$$
 
-with one independent binary classifier per cause. Softmax and multiclass are rejected outright: the generator draws 1-3 causes per event at 50/35/15%, so causes demonstrably co-occur and probabilities must not be forced to sum to one. A full 2^7 joint-label model and classifier chains are also rejected: 37 events do not cover enough label combinations, and chain results depend on label order.
+with one independent binary scorer per cause. Five causes use fitted classifiers; the two causes represented by only one event each use deterministic rules. Softmax and multiclass are rejected outright: the generator draws 1-3 causes per event at 50/35/15%, so causes demonstrably co-occur and probabilities must not be forced to sum to one. A full 2^7 joint-label model and classifier chains are also rejected: 37 events do not cover enough label combinations, and chain results depend on label order.
 
 Conditioning on the Task 1 flag is deliberate. Training on flagged rows only reproduces the production population rather than the easier but mismatched `P(Y|X)` over all months.
 
@@ -24,7 +24,7 @@ Conditioning on the Task 1 flag is deliberate. Training on flagged rows only rep
 
 **Metric selection.** All five primary metrics (ROAS, RROI, iROAS, MAS, spend) enter the feature matrix. The exercise brief names five primary metrics and does not ask for a subset, and narrowing measurably hurts: restricting to RROI/ROAS/iROAS drops the candidate set from 466 to 245, the labelled candidates from 106 to 59, and roughly halves the positives on every cause (`mix_shift_artifact` falls from 12 rows to 3). Task 1's metric ranking is not reused here, because **detector quality and feature informativeness are different questions**. iROAS is a poor detector (15.8% recall at a 40% shock) but a strong feature: the data dictionary's cause signatures invoke it for three of seven causes. At the feature level its trailing baseline is computable on 79.7% of rows, identical to ROAS, RROI and spend, because the 9-of-12-month tolerance absorbs its 15% missingness. All four leading indicators (CTR, CPC, PICR, impression share) are included.
 
-**Candidate construction.** Re-running the Task 1 detector (held verbatim in `attribution_lib.py`, not read from the possibly-stale flag CSVs) gives 779 metric-specific flags, which outer-union and deduplicate to **466 investigations** at 1.67 flags each. 232 fire on one metric, 175 on two, 59 on three or more. Of those, **106 coincide with an injected anomaly row (candidate precision 0.23)**; the other 360 are retained with an all-zero target vector. Those negatives are not noise to be discarded, they are what teaches the model to score low instead of manufacturing an explanation.
+**Candidate construction.** Re-running the Task 1 detection logic in `attribution_lib.py` with unrounded coverage floors gives 779 metric-specific flags, four more than Task 1's rounded-floor output, without relying on possibly stale flag CSVs. These flags outer-union and deduplicate to **466 investigations** at 1.67 flags each. 232 fire on one metric, 175 on two, 59 on three or more. Of those, **106 coincide with an injected anomaly row (candidate precision 0.23)**; the other 360 are retained with an all-zero target vector. Those negatives are not noise to be discarded, they are what teaches the model to score low instead of manufacturing an explanation.
 
 **Label scarcity is the binding constraint**, and it is about events, not rows:
 
@@ -44,7 +44,7 @@ Conditioning on the Task 1 flag is deliberate. Training on flagged rows only rep
 
 ## Model design
 
-**Chosen: one-vs-rest L2-regularised logistic regression.** Seven independent binary models give a factorised Bernoulli approximation to the joint multi-label distribution, train in seconds, and expose signed per-case contributions an analyst can read. Median imputation and standardisation sit *inside* the sklearn pipeline so their statistics are learned on training folds only.
+**Chosen: five one-vs-rest L2-regularised logistic regressions plus two deterministic rules.** The five fitted classifiers give a factorised Bernoulli approximation to their multi-label distribution, train in seconds, and expose signed per-case contributions an analyst can read. The two one-event causes use deterministic rules until enough independent events exist to fit and validate classifiers. Median imputation and standardisation sit *inside* the sklearn pipeline so their statistics are learned on training folds only.
 
 `C = 0.1` is fixed **a priori** from the feature-to-positive ratio, not tuned on the data. With 60 features and 11-28 positives per cause the design is 2-5 features per positive and materially over-parameterised. A development-time sweep, not shipped in the notebook, confirmed the choice is not on a cliff: macro PR-AUC ran 0.485 / 0.468 / 0.439 / 0.433 at C = 0.03 / 0.1 / 0.3 / 1.0, falling monotonically as regularisation weakens, which is itself the signature of over-parameterisation. `class_weight='balanced'` offsets prevalence of 2-10% without resampling, at the calibration cost quantified below.
 
@@ -79,11 +79,11 @@ The peer block excludes the target row from its own peer aggregate, which is wha
 
 | cause | top block | PR-AUC drop | matches expected signature? |
 |---|---|---|---|
-| creative_refresh | leading PICR | 0.485 | yes - PICR/CTR ramp |
-| genuine_efficiency_gain | leading CTR | 0.455 | yes - CTR/PICR with stable spend |
-| survivorship_bias | impression share | 0.409 | yes - sharp impression-share cut |
-| measurement_artifact | cross-metric | 0.285 | yes - the ROAS-RROI wedge |
-| spend_reduction_artifact | reliability | 0.114 | no - see below |
+| creative_refresh | leading PICR | 0.455 | yes - PICR/CTR ramp |
+| genuine_efficiency_gain | leading CTR | 0.132 | yes - CTR/PICR with stable spend |
+| survivorship_bias | impression share | 0.433 | yes - sharp impression-share cut |
+| measurement_artifact | cross-metric | 0.103 | yes - the ROAS-RROI wedge |
+| spend_reduction_artifact | impression share | 0.134 | yes - reduced reach and spend context |
 
 ## Evaluation
 
@@ -104,7 +104,7 @@ The logistic model beats both baselines on three of five causes and macro-averag
 
 **The abstention state is the safety property that matters.** 261 of 466 candidates (56%) fall below threshold on every cause. Of those, **88.9% genuinely have no injected cause**, against 62.4% among candidates where a cause is proposed. The system is therefore concentrating its confidence where the labels actually are.
 
-**Interrogating results that look too good.** `creative_refresh` at PR-AUC 0.876 against a 0.060 floor demanded a leakage check. Two development-time checks, cut from the notebook to keep it minimal, cleared it. It is simulator recovery rather than leakage: the generator multiplies CTR and PICR directly for this cause, and `creative_refresh` has 22 rows uncontaminated by `genuine_efficiency_gain` against the latter's 6. Nothing resembling 0.876 should be expected on real data. An ablation of the `reliability` block, which had ranked suspiciously high for `spend_reduction_artifact`, moved every cause by at most 0.024 PR-AUC with inconsistent sign, so metadata is substitutable rather than load-bearing.
+**Interrogating results that look too good.** `creative_refresh` at PR-AUC 0.876 against a 0.060 floor demanded a leakage check. Two development-time checks, cut from the notebook to keep it minimal, cleared it. It is simulator recovery rather than leakage: the generator multiplies CTR and PICR directly for this cause, and `creative_refresh` has 22 rows uncontaminated by `genuine_efficiency_gain` against the latter's 6. Nothing resembling 0.876 should be expected on real data. An ablation of the `reliability` block moved every cause by at most 0.024 PR-AUC with inconsistent sign, so reliability metadata is not load-bearing.
 
 **Cut from this build, and why.** Sudden-vs-gradual, single-vs-multi-cause, seen-vs-unseen-brand and event-magnitude slices, event-grouped bootstrap CIs, and top-2 recall are all specified and all omitted: with 23 labelled event groups, slicing five ways leaves single-digit cells whose intervals would be too wide to inform a decision. They become worthwhile the moment auxiliary panels exist.
 
@@ -144,10 +144,10 @@ No autonomous budget action is taken.
 
 The system runs monthly once reporting closes. Task 1 emits a deduplicated candidate table; a versioned feature pipeline applies saved trailing-baseline and standardisation parameters; the attribution service returns cause scores, top supporting signals and an abstention state. Analysts confirm causes, reject suggestions, or mark unknown in the existing investigation workflow.
 
-**Retraining cannot be label-driven, and the arithmetic decides this.** The panel produces 37 events over 48 months across 42 series, or **9.2 events per year**. Waiting for 100 adjudicated investigations would take roughly 130 months. An 11-year retraining cycle is not a policy, so the design has to change rather than the cadence:
+**Retraining cannot be label-driven, and the arithmetic decides this.** The panel contains 37 injected events over 48 months, but only 25 produce a Task 2 candidate. At the current selection rate, that is **6.25 observable positive events per year**. Accumulating 100 comparable, confirmed events would take about 16 years; even the upper-bound rate based on all 37 events implies about 11 years. That is not a workable retraining cycle, so the design has to change rather than the cadence:
 
 - The model is **synthetically pretrained** and refreshed when the generator's assumptions are revised, not when labels accumulate.
-- Adjudications accumulate as a slow **validation and calibration** set, not a training set. At ~9 events per year, the first meaningful calibration check lands after roughly five years.
+- Adjudications accumulate as a slow **validation and calibration** set, not a training set. There is no defensible fixed five-year calibration date: at the current observable rate, five years would provide only about 31 independent positive events overall and fewer for each cause. Calibration should begin only when cause-level sample sizes support it.
 - The retrain **trigger is drift, plus an annual scheduled refit**. Never a monthly refit: with 23 event groups that resamples noise.
 
 **Drift detection is therefore the primary monitoring job**, because it fires years before labels do. Monitored against the baselines this build establishes: Task 1 alert volume (~9.7 candidates/month), abstention rate (56%), per-cause score prevalence, iROAS missingness (11.8%), feature distributions across the 60 columns, and coefficient sign stability between refits. A rising abstention rate is the earliest signal that the taxonomy no longer covers what is happening.
@@ -173,7 +173,7 @@ The system runs monthly once reporting closes. Task 1 emits a deduplicated candi
 
 **Inherited selection boundary.** 58% of true anomaly rows never reach attribution, and every score is conditional on the detector version. A novel cause outside the taxonomy will either score low or, worse, resemble a known one.
 
-**Two ways to add data, fixing different problems.** Re-running the seed-parameterised generator yields ~10 panels in about 20 seconds with exact labels, fixing variance, calibration and the two one-event causes. Analyst adjudication yields ~9 noisy labels a year with the real-world distribution, fixing simulator-to-real shift. Neither adds a column, so neither resolves identification.
+**Two ways to add data, fixing different problems.** Re-running the seed-parameterised generator yields ~10 panels in about 20 seconds with exact labels, fixing variance, calibration and the two one-event causes. At the current Task 2 selection rate, analyst adjudication can add about six confirmed positive events per year from the real-world distribution, helping address simulator-to-real shift. Neither adds a column, so neither resolves identification.
 
 **Most valuable additional data**, in order: creative and campaign launch metadata; placement-level inclusion and dropout logs; planned budgets and optimisation actions; attribution-methodology change logs; category demand and promotion controls; repeated incrementality experiments with uncertainty intervals.
 
