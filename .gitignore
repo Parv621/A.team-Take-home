@@ -1,0 +1,36 @@
+# Track only the submission files. Local authoring files, environments, backups,
+# caches, and generated notebook outputs remain outside the repository.
+*
+!.gitignore
+!README.md
+!requirements.txt
+!run_all.py
+!design_proposal.md
+
+!data/
+data/*
+!data/README.md
+!data/brief_metrics.csv
+!data/data_dictionary.md
+!data/design_decisions.md
+!data/generate_synthetic_data.py
+!data/panel_data_full.csv
+!data/ground_truth/
+data/ground_truth/*
+!data/ground_truth/ground_truth.csv
+!data/ground_truth/ground_truth_events.csv
+
+!anomaly_detection/
+anomaly_detection/*
+!anomaly_detection/README.md
+!anomaly_detection/anomaly_detection.ipynb
+!anomaly_detection/proposal_anomaly_detection.md
+
+!attribution/
+attribution/*
+!attribution/README.md
+!attribution/attribution.ipynb
+!attribution/attribution_lib.py
+!attribution/classification_flow.png
+!attribution/proposal_attribution.md
+!attribution/render_classification_flow.py
