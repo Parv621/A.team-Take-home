@@ -46,11 +46,11 @@ Conditioning on the Task 1 flag is deliberate. Training on flagged rows only rep
 
 **Chosen: one-vs-rest L2-regularised logistic regression.** Seven independent binary models give a factorised Bernoulli approximation to the joint multi-label distribution, train in seconds, and expose signed per-case contributions an analyst can read. Median imputation and standardisation sit *inside* the sklearn pipeline so their statistics are learned on training folds only.
 
-`C = 0.1` is fixed **a priori** from the feature-to-positive ratio, not tuned on the data. With 60 features and 11-28 positives per cause the design is 2-5 features per positive and materially over-parameterised. A sensitivity check confirms the choice is not on a cliff: macro PR-AUC runs 0.485 / 0.468 / 0.439 / 0.433 at C = 0.03 / 0.1 / 0.3 / 1.0, falling monotonically as regularisation weakens, which is itself the signature of over-parameterisation. `class_weight='balanced'` offsets prevalence of 2-10% without resampling.
+`C = 0.1` is fixed **a priori** from the feature-to-positive ratio, not tuned on the data. With 60 features and 11-28 positives per cause the design is 2-5 features per positive and materially over-parameterised. A development-time sweep, not shipped in the notebook, confirmed the choice is not on a cliff: macro PR-AUC ran 0.485 / 0.468 / 0.439 / 0.433 at C = 0.03 / 0.1 / 0.3 / 1.0, falling monotonically as regularisation weakens, which is itself the signature of over-parameterisation. `class_weight='balanced'` offsets prevalence of 2-10% without resampling, at the calibration cost quantified below.
 
 **Rejected, with reasons.** *Gradient-boosted trees (XGBoost)* are the natural challenger and would test whether the conjunctions matter (genuine efficiency needs PICR and CTR up *while* spend and impression share hold). They are not implemented here: with 23 labelled event groups, a boosted model's extra capacity would be spent memorising events, and choosing between the families on a 23-group CV would not be a real selection. This is a deferral on evidence, not a claim that logistic regression wins in general. *LightGBM and CatBoost* are credible alternatives to XGBoost, but the inputs are almost entirely numeric so CatBoost's categorical handling adds little, and a three-library bake-off would spend the budget on breadth rather than attribution quality. *Neural networks* are unnecessary on a 466-row structured problem. *Bayesian causal networks* would add strong priors and computation without resolving identification from monthly aggregates.
 
-**Calibration: none, deliberately.** Platt scaling needs an independent calibration sample; with 11-28 positives per cause it would fit noise, and isotonic regression is far worse at this size. Outputs are therefore described as **ranking scores, not calibrated probabilities**, everywhere they appear. The reliability curve in the notebook shows scores sitting above the diagonal, which is expected once `class_weight='balanced'` reweights the intercept. Calling these probabilities would be the single easiest place to overclaim, so the interface does not.
+**Calibration: none, deliberately.** Platt scaling needs an independent calibration sample; with 11-28 positives per cause it would fit noise, and isotonic regression is far worse at this size. Outputs are therefore described as **ranking scores, not calibrated probabilities**, everywhere they appear. The notebook measures the gap: the pooled reliability curve sits below the diagonal at every bin (top bin: mean score 0.56 against a true rate of 0.23), and per-cause mean scores run 1.4x to 4.2x above the actual rate, 2.7x pooled. `class_weight='balanced'` causes this by treating a 3% class as if it were 50%, which lifts the intercept. Calling these probabilities would be the single easiest place to overclaim, so the interface does not.
 
 ## Feature engineering
 
@@ -102,27 +102,39 @@ Splits are **event-grouped, never random by row**. Overlapping event ids are mer
 
 The logistic model beats both baselines on three of five causes and macro-averages 0.468 against the rule's 0.341 and the 0.036 floor. **It loses to the hand-written rule on two.** For `measurement_artifact` the model finds the right signal (the ROAS-RROI wedge is its largest coefficient at +0.996) but cannot fit it from 11 positives across 60 features, while the rule encodes it directly. The honest recommendation is a hybrid: ship the rule for `measurement_artifact` and `spend_reduction_artifact` alongside the rule-scored macro causes, and the fitted model for the other three.
 
-**Multi-label quality** at the 0.30 abstention threshold: macro F1 0.339, micro F1 0.346, sample-averaged Jaccard 0.083. Jaccard is low because most candidates are true all-zeros, where any proposed cause scores zero overlap.
-
 **The abstention state is the safety property that matters.** 261 of 466 candidates (56%) fall below threshold on every cause. Of those, **88.9% genuinely have no injected cause**, against 62.4% among candidates where a cause is proposed. The system is therefore concentrating its confidence where the labels actually are.
 
-**Interrogating results that look too good.** `creative_refresh` at PR-AUC 0.876 against a 0.060 floor demanded a leakage check. It is not leakage, it is simulator recovery: the generator multiplies CTR and PICR directly for this cause, so a strong PICR residual really is its signature, and `creative_refresh` has 22 rows uncontaminated by `genuine_efficiency_gain` against the latter's 6. Nothing resembling 0.876 should be expected on real data. Separately, the `reliability` block ranking top for `spend_reduction_artifact` looked like the model keying on series identity rather than mechanism; an ablation shows removing that block moves every cause by at most 0.024 PR-AUC with inconsistent sign, so it is substitutable rather than load-bearing.
+**Interrogating results that look too good.** `creative_refresh` at PR-AUC 0.876 against a 0.060 floor demanded a leakage check. Two development-time checks, cut from the notebook to keep it minimal, cleared it. It is simulator recovery rather than leakage: the generator multiplies CTR and PICR directly for this cause, and `creative_refresh` has 22 rows uncontaminated by `genuine_efficiency_gain` against the latter's 6. Nothing resembling 0.876 should be expected on real data. An ablation of the `reliability` block, which had ranked suspiciously high for `spend_reduction_artifact`, moved every cause by at most 0.024 PR-AUC with inconsistent sign, so metadata is substitutable rather than load-bearing.
 
 **Cut from this build, and why.** Sudden-vs-gradual, single-vs-multi-cause, seen-vs-unseen-brand and event-magnitude slices, event-grouped bootstrap CIs, and top-2 recall are all specified and all omitted: with 23 labelled event groups, slicing five ways leaves single-digit cells whose intervals would be too wide to inform a decision. They become worthwhile the moment auxiliary panels exist.
 
 ## Causal honesty
 
-The model estimates `P(injected cause label | observed evidence, Task 1 flagged)`. It does **not** estimate the causal effect of CTR, spend or creative on performance. Synthetic causes are causal by construction *inside the simulator*; a classifier trained to recognise their signatures remains associational when pointed at real data. iROAS is itself an incrementality estimate, but using a noisy iROAS observation as one feature does not make the attribution model causal - it provides stronger corroborating evidence, nothing more.
+The model estimates `P(injected cause label | observed evidence, Task 1 flagged)`. It does **not** estimate the causal effect of CTR, spend or creative on performance, and no part of this pipeline could: nothing was randomised or withheld, so the counterfactual is never observed. Synthetic causes are causal by construction *inside the simulator*; a classifier trained to recognise their signatures remains associational when pointed at real data. iROAS is itself an incrementality estimate, but using it as one feature does not make the attribution model causal.
 
 Ground truth here validates recovery of a known data-generating process, not truth in the market.
+
+**Two claims that are usually asserted are measured instead.**
+
+*The selection boundary is 58%.* The panel contains 254 true anomaly rows. Only 106 (42%) survive Task 1 and reach attribution; 148 are invisible to it, and 12 of 37 events never surface a single candidate row. Attribution cannot explain what the detector did not flag, and this is a measured share rather than a caveat.
+
+*The causes are far less separable than per-cause PR-AUC suggests.* Scoring each cause's true positive rows with every model gives:
+
+| true cause (n) | genuine | spend_red | surviv | creative | measure |
+|---|---|---|---|---|---|
+| genuine_efficiency (12) | 0.465 | **0.504** | 0.219 | 0.499 | 0.166 |
+| spend_reduction (18) | 0.393 | 0.420 | 0.311 | **0.467** | 0.333 |
+| survivorship (15) | 0.376 | **0.813** | 0.799 | 0.561 | 0.278 |
+| creative_refresh (28) | 0.430 | 0.578 | 0.319 | **0.881** | 0.314 |
+| measurement_artifact (11) | 0.206 | **0.480** | 0.311 | 0.447 | 0.296 |
+
+**Only `creative_refresh` is the top scorer on its own positive rows.** `survivorship_bias` loses to `spend_reduction_artifact` by 0.813 to 0.799, which is the near-identity in the data dictionary appearing in measured output; `measurement_artifact` ranks fourth of five on its own rows. A meaningful share of each model's apparent discrimination is a shared "something anomalous happened" signal rather than cause-specific evidence. That is the concrete reason the interface presents ranked candidates with an abstention state instead of a single answer.
 
 The analyst-facing language is hedged to match, and is generated directly by the notebook:
 
 > *Snacks / CrispBite / display / 2023-01: the observed pattern is most consistent with survivorship bias (1.00) under the synthetic training distribution. Largest contributing signals: impression_share_resid (+5.55), impression_share_d1 (+3.23), impression_share_d3 (+1.57). Second candidate: spend reduction artifact (1.00). This is diagnostic evidence, not proof of cause.*
 
-That example is also a good illustration of a real limit: both survivorship and spend reduction score 1.00 because they are near-identical by construction, and the true label carries both plus creative refresh. The system showing overlapping scores is correct behaviour, not indecision.
-
-Where evidence is weak the output abstains rather than reaching for the least-bad label:
+Both survivorship and spend reduction score 1.00 there, and the true label carries both plus creative refresh. Overlapping scores are correct behaviour, not indecision. Where evidence is weak the output abstains instead of reaching for the least-bad label:
 
 > *HomeCare / CleanWave / paid_search / 2023-11: insufficient evidence for a known cause (top score measurement artifact 0.03, below the 0.30 abstention threshold). Route to manual review.*
 
@@ -130,26 +142,41 @@ No autonomous budget action is taken.
 
 ## Productionisation
 
-The system runs monthly once reporting closes. Task 1 emits a deduplicated candidate table; a versioned feature pipeline applies saved trailing-baseline and standardisation parameters; the attribution service returns cause scores, top supporting signals and an abstention state. Analysts confirm multiple causes, reject suggestions, or mark unknown in the existing investigation workflow, which is what generates real labels over time.
+The system runs monthly once reporting closes. Task 1 emits a deduplicated candidate table; a versioned feature pipeline applies saved trailing-baseline and standardisation parameters; the attribution service returns cause scores, top supporting signals and an abstention state. Analysts confirm causes, reject suggestions, or mark unknown in the existing investigation workflow.
 
-**Retraining.** Not on a fixed clock. Retrain when enough newly adjudicated events accumulate (roughly 100 reviewed investigations with representation across causes) or when monitoring shows drift. With 23 event groups, a monthly retrain would just resample noise.
+**Retraining cannot be label-driven, and the arithmetic decides this.** The panel produces 37 events over 48 months across 42 series, or **9.2 events per year**. Waiting for 100 adjudicated investigations would take roughly 130 months. An 11-year retraining cycle is not a policy, so the design has to change rather than the cadence:
 
-**Monitoring.** Feature distributions, missingness rates, alert volume, per-cause score prevalence, abstention rate, coefficient stability, and calibration on reviewed cases. A rising abstention rate is the early-warning signal that the taxonomy no longer covers what is happening.
+- The model is **synthetically pretrained** and refreshed when the generator's assumptions are revised, not when labels accumulate.
+- Adjudications accumulate as a slow **validation and calibration** set, not a training set. At ~9 events per year, the first meaningful calibration check lands after roughly five years.
+- The retrain **trigger is drift, plus an annual scheduled refit**. Never a monthly refit: with 23 event groups that resamples noise.
 
-**Cold start.** Pooled BU-channel baselines, never a per-brand model. A new series carries explicit history and missingness features; under 12 months it receives the expert-signature fallback and a lower-confidence label until the robust baseline stabilises. An unseen brand is still scorable because the model uses normalised behaviour and peer context rather than brand identity.
+**Drift detection is therefore the primary monitoring job**, because it fires years before labels do. Monitored against the baselines this build establishes: Task 1 alert volume (~9.7 candidates/month), abstention rate (56%), per-cause score prevalence, iROAS missingness (11.8%), feature distributions across the 60 columns, and coefficient sign stability between refits. A rising abstention rate is the earliest signal that the taxonomy no longer covers what is happening.
+
+**One trap worth naming: an unreviewed alert is not a negative.** Training on "the analyst never confirmed it" learns analyst workload, not causes. Only explicit adjudications count, and unreviewed rows stay unlabelled.
+
+**Cold start** is concrete rather than hypothetical. Four of 42 series are already unscoreable at under 12 months of history, and a robust residual needs 9 of the trailing 12 months present. A new brand receives pooled BU-channel baselines, expert-rule scores only, and an explicit low-confidence flag until it clears 12 months. It never gets its own model. An unseen brand is still scorable thereafter because the model uses normalised behaviour and peer context rather than brand identity.
 
 ## Limits
 
-**Not identifiable from monthly aggregates.** `survivorship_bias` and `spend_reduction_artifact` are near-identical by design and separating them would need placement-level retention and reporting-completeness data. `creative_refresh` and `genuine_efficiency_gain` differ only in later decay, which is unknowable at onset without creative IDs and launch dates. The model should show overlapping scores in these cases rather than manufacture separation, and it does.
+**More rows fix variance; only more columns fix identification.** This distinction decides what is worth building next:
+
+| cause | limited by | do auxiliary panels help? |
+|---|---|---|
+| `mix_shift_artifact`, `external_demand_spike` | one event each | **yes** - distinct mechanisms, no data |
+| `measurement_artifact` | 11 positives | **yes** - the ROAS-RROI wedge is a distinct signature the model already locates (top coefficient +0.996) |
+| `survivorship_bias` vs `spend_reduction_artifact` | identification | **no** - near-identical by construction; needs placement-level retention data |
+| `genuine_efficiency_gain` vs `creative_refresh` | both | partly - 12 positives, and separation at onset needs creative launch dates |
+
+**Not calibrated.** These are ranking scores, running 1.4x to 4.2x above the true rate per cause and 2.7x pooled, because `class_weight='balanced'` treats a 3% class as if it were 50%. Calling them probabilities would require both an unweighted refit and far more than 23 independent event groups.
 
 **Not fitted.** `mix_shift_artifact` and `external_demand_spike` are rule-scored on one event each.
 
-**Not calibrated.** These are ranking scores. Calling them probabilities would require far more independent events than 23.
+**Inherited selection boundary.** 58% of true anomaly rows never reach attribution, and every score is conditional on the detector version. A novel cause outside the taxonomy will either score low or, worse, resemble a known one.
 
-**Inherited selection boundary.** Task 2 cannot explain an event Task 1 missed, and every score is conditional on the detector version. A novel cause outside the taxonomy will either score low or, worse, resemble a known one.
+**Two ways to add data, fixing different problems.** Re-running the seed-parameterised generator yields ~10 panels in about 20 seconds with exact labels, fixing variance, calibration and the two one-event causes. Analyst adjudication yields ~9 noisy labels a year with the real-world distribution, fixing simulator-to-real shift. Neither adds a column, so neither resolves identification.
 
 **Most valuable additional data**, in order: creative and campaign launch metadata; placement-level inclusion and dropout logs; planned budgets and optimisation actions; attribution-methodology change logs; category demand and promotion controls; repeated incrementality experiments with uncertainty intervals.
 
-**With more time**, in priority order: parameterise the generator by seed and produce 8-10 auxiliary training panels holding seed-42 as an untouched test, which unlocks the two rule-scored causes, Platt calibration, the evaluation slices, and a fair XGBoost comparison in that order.
+**With more time**, in priority order: parameterise the generator by seed and produce 8-10 auxiliary training panels holding seed-42 as an untouched test, which unlocks the two rule-scored causes, an unweighted-plus-calibrated refit, the evaluation slices, and a fair XGBoost comparison in that order.
 
 Until then this is a transparent, human-in-the-loop diagnostic prioritisation system, not a causal attribution engine.

@@ -36,11 +36,11 @@ python run_all.py
 |   `-- ground_truth/               # Evaluation-only labels and event log
 |-- anomaly_detection/
 |   |-- README.md
-|   |-- anomaly_detection.ipynb
+|   |-- anomaly_detection.ipynb     # Main notebook for Anomaly detection
 |   `-- proposal_anomaly_detection.md
 `-- attribution/
     |-- README.md
-    |-- attribution.ipynb
+    |-- attribution.ipynb           # Main notebook for Attribution
     |-- attribution_lib.py
     |-- proposal_attribution.md
     |-- classification_flow.png
@@ -49,7 +49,12 @@ python run_all.py
 
 ## Time spent
 
-**TODO before submission:** replace this line with the honest total time spent on the exercise.
+Approx 1.5 working days of effort.
+
+- Data Generation: 3 hours
+- Anomaly detection + understanding trends: 4 hours
+- Attribution analysis: 4 hours
+- Report writng, edits and publishing: 3 hours
 
 ## Reproducibility note
 
