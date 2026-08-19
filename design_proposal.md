@@ -1,107 +1,106 @@
-# The Design Proposal
+# Model-driven anomaly detection and attribution
 
-*Anomaly detection and probabilistic attribution for media-performance spikes*
+*Design proposal for explaining media-performance spikes before monthly reporting*
 
-## Problem framing
+## Executive answer
 
-I frame the solution as a two-stage, human-in-the-loop decision-support system, not an automated attribution engine.
+The evidence supports augmenting the manual process, but not replacing it. After the monthly close and before report circulation, the proposed system can identify statistically and commercially unusual changes, rank likely drivers, distinguish likely genuine gains from spend, mix, or reporting artifacts, and draft an evidence-backed explanation. The analyst remains responsible for confirming the cause, editing the narrative, and approving any budget decision.
 
-First, the [Task 1 anomaly-detection notebook][task-1-notebook] converts monthly business unit, brand, and channel data into a prioritized queue of unusual performance changes.
+The current proof of concept has three important limits. It was validated on synthetic rather than confirmed real-world causes, 58% of true anomaly rows never reach attribution, and several causes produce overlapping signals. The system should therefore launch as an analyst decision-support tool with an explicit abstention path, not as an autonomous attribution engine.
 
-For each flagged investigation, I use multi-label binary classification to score each candidate cause independently.
+## Business need and operating model
 
-This framing reflects business reality: efficiency gains, creative changes, spend cuts, mix shifts, and reporting artifacts can occur together, whereas multiclass classification would force one answer.
+A brand analyst currently investigates each spike with a manual checklist that takes days, often after the monthly report has circulated. The analytics lead owns the investigation queue, while brand and media-planning teams act on the result. The proposed system moves triage and an initial explanation ahead of report circulation without transferring accountability from the analyst.
 
-The models use existing performance and leading-indicator data: ROAS, RROI, iROAS, MAS, spend, CTR, CPC, PICR, and impression share—plus anomaly evidence, lags, peer context, and channel mix.
+The primary RROI monitoring view, based on media-attributable sales divided by spend, produces 2.9 alerts per month across 38 scored series, equivalent to about 8.6 analyst-hours. The workload estimate uses the midpoint of the 2-to-4-hour review range: `(137 alerts / 48 months) × 3 hours = 8.56 hours`, rounded to 8.6. Attribution considers flags across all five performance metrics, or 9.7 investigations per month, and abstains on 56% of them.
 
-When month-end data arrives, the system ranks drivers, abstains when evidence is weak, and drafts a narrative before report circulation, reducing triage while keeping the analyst responsible for the final explanation and any budget decision.
+This design reflects an asymmetric cost. A false alert consumes 2 to 4 analyst-hours, while a miss can support an incorrect narrative or budget decision. The detector therefore favors precision and reports the recall it gives up instead of hiding it.
 
 ## Data strategy
 
-I used a bottom-up simulator so anomalies represent business mechanisms, not isolated metric jumps. Eight primitives—eligible impressions, impression share, CTR, CPC, PICR, baseline PICR, average order value, and attribution inflation—receive trend, asymmetric seasonality, and AR(1) noise. Derived metrics preserve accounting identities; a top-down correlated generator might not.
+The bottom-up simulator creates anomalies from business mechanisms rather than isolated metric jumps. Eight inputs—eligible impressions, impression share, click-through rate (CTR), cost per click (CPC), post-impression conversion rate (PICR), baseline PICR, average order value, and attribution inflation—include trend, seasonality, and autoregressive noise. Derived metrics preserve accounting identities; `data/data_dictionary.md` documents the definitions.
 
-- **Event sampling.** Each brand-channel series draws zero to two events, with an extra opportunity for longer histories. Starts are separated by at least four months. Brand-channel events are 60% sudden and 40% three-month ramps; 50% have one cause, 35% two, and 15% three.
-- **Mechanism injection.** Injections change primitives before recalculation: genuine efficiency and creative refresh lift CTR/PICR, with refresh decaying; spend reduction and survivorship cut impression share with different composition effects; mix shift reallocates share across channels; demand lifts exposure and baseline PICR across a business unit; measurement artifacts change attribution inflation only.
-- **Label creation.** Injection records event IDs and active causes by business unit, brand, channel, and month. Row labels and an event-grain log are written to evaluation-only `data/ground_truth/`; missingness is generated independently to avoid label leakage.
-- **Data contract.** `data/brief_metrics.csv` is the modeling input. `data/panel_data_full.csv` adds observable funnel diagnostics and a noisy `analyst_tag`. `data/generate_synthetic_data.py` rebuilds the outputs, while `data/data_dictionary.md` and `data/design_decisions.md` document assumptions. Limits include simulator-defined causality, aggregate monthly signals, generic engagement metrics for TV/OOH, and limited macro-event diversity.
+- **Events.** Each series contains zero to two events, starting at least four months apart. Events can be sudden or gradual, and half contain multiple causes. `data/design_decisions.md` contains the parameters.
+- **Mechanisms.** Efficiency and creative refresh increase CTR and PICR; spend reduction and survivorship reduce impression share. Mix shift reallocates share, external demand affects a business unit, and measurement artifacts change attribution inflation only.
+- **Labels and limits.** The pipeline withholds event labels until evaluation to prevent leakage. The simulator defines causality, signals are monthly aggregates, TV and out-of-home channels reuse generic engagement measures, and macro-event diversity is limited.
 
 ## Model design
 
-### 1. Anomaly detection
+The system has two stages. Stage 1 returns an anomaly flag and evidence score, but no cause. Stage 2 ranks seven causes independently because several can occur together. The scores do not sum to one and are not calibrated probabilities; an abstention state represents insufficient evidence.
 
-The unsupervised detector scores each business unit–brand–channel monthly series. It returns a flag and evidence score, not a cause.
+### Stage 1: Anomaly detection
 
-- **Baseline and noise control.** The naive baseline is a 12-month rolling z-score based on the mean and standard deviation of month-over-month change. The chosen, look-ahead-safe detector uses median and median absolute deviation (MAD) z-scores on one-month and three-month cumulative changes. A flag must pass two gates. I chose **|z| > 2.5** as a precision-leaning cutoff that keeps the monthly review queue manageable while retaining useful recall in injection tests. The **metric-specific 75th-percentile movement floor** removes statistically unusual but commercially small moves and respects each metric’s normal volatility. The **12-month trailing window** spans one seasonal cycle, while median/MAD prevents earlier spikes from shifting the baseline. I rejected STL and isolation forest for limited benefit and weaker explainability.
-- **Metric roles and indicators.** All five metrics are scored. RROI is primary based on its balance of recall and false-positive rate; ROAS is secondary; MAS and spend expose scale and denominator effects; iROAS provides corroboration despite noise and lower coverage. Same-month CTR, CPC, PICR, and impression-share movements form a 0–4 evidence count, not a cause label.
-- **History and irregular spend.** Series with fewer than 12 months go to manual review; those with 12–24 months use a six-month mean/std level test at |z| > 3.0; those with at least 24 months use the full dual test. Windows need 75% valid observations without imputation. Using spend and MAS beside return ratios keeps irregular-spend denominator effects visible.
-- **Tradeoff and onset.** False alerts cost 2–4 analyst hours; misses can support a wrong narrative or budget decision. At the chosen operating point, the detector produces about **2.9 RROI alerts and 8.6 review hours per month**. The one-month arm targets sudden shocks; the cumulative arm targets three-month ramps. Across 20–40% injected shocks, recall was 34–74% sudden and 47–61% gradual, so coverage remains incomplete.
+- **Baseline and thresholds.** The selected, look-ahead-safe detector replaces a rolling mean and standard deviation with median and median absolute deviation (MAD) z-scores for one-month and three-month changes. On return on ad spend (ROAS), it flags 74 level shifts, compared with 48 for the naive baseline. A change must exceed both an absolute z-score of 2.5 and its metric's 75th-percentile movement floor: RROI 14%, ROAS 15%, media-attributable sales (MAS) 22%, spend 24%, and incremental ROAS (iROAS) 37%.
+- **Seasonality.** Rolling MAD does not remove seasonality; it absorbs seasonal change into the noise estimate. This raises the effective threshold for volatile series. Explicit seasonal decomposition remains untested.
+- **Metric roles.** RROI is primary based on recall and false-positive rate. ROAS is secondary, MAS and spend expose denominator effects, and iROAS corroborates despite only 31.5% z-score coverage. CTR, CPC, PICR, and impression-share movements provide supporting evidence, not cause labels.
+- **Limited history.** Series with less than 12 months of history go to manual review. Those with 12 to 24 months use a six-month test at an absolute z-score above 3.0; longer series use the dual test. Every window requires at least 75% valid observations, without imputation.
+- **Detection performance.** For RROI shocks of 20% to 40%, recall ranges from 34.2% to 73.7% for sudden events and 47.4% to 60.5% for gradual events, against an 8.5% false-positive rate.
 
-### 2. Probabilistic attribution
+### Stage 2: Driver attribution
 
-The [Task 2 attribution notebook][task-2-notebook] converts each deduplicated [Task 1 investigation][task-1-notebook] into seven independent cause scores. I use multi-label one-vs-rest classification because several mechanisms can occur together; scores do not need to sum to one. They rank explanations for analyst review and are not calibrated probabilities.
+Formally, this is a multi-label, one-versus-rest binary classification problem over the Stage 1 investigation queue. One example is one deduplicated business unit–brand–channel–month, even when several metrics flag it. For each cause `c`, the target `Y_c` equals 1 when that cause is active and 0 otherwise. A row can therefore have several positive targets or an all-zero target vector. Given the 60 observable features `X`, each scorer ranks evidence for `Y_c = 1`, conditional on Stage 1 having flagged the row. Scores above 0.30 form the proposed cause set; if none qualify, the system abstains.
 
-- **Model choice and baselines.** Five causes use separate L2-regularized logistic regressions. Median imputation and standardization are learned inside each training fold; `class_weight='balanced'` addresses rare causes, and fixed `C=0.1` limits overfitting. Mix shift and external demand use expert rules because each has only one independent event. Baselines are cause prevalence and deterministic expert signatures. I rejected multiclass softmax because causes co-occur. XGBoost is deferred because the small event count makes memorization more likely than a reliable comparison.
-- **Cause taxonomy.** Genuine efficiency is a sustained CTR/PICR improvement; creative refresh is temporary. Spend reduction and survivorship represent delivery cuts with different severity. Measurement artifact is a ROAS–RROI divergence without real movement. Mix shift reallocates spend toward a stronger channel; external demand moves peers across a business unit. The first five causes are fitted and the last two are rule-scored.
-- **Feature families.** ROAS, RROI, iROAS, MAS, and spend describe outcome movement and [Task 1 anomaly evidence][task-1-notebook]. CTR, CPC, PICR, and impression share distinguish engagement, auction cost, conversion, and delivery. Cross-metric features capture the ROAS–RROI wedge, iROAS–RROI agreement, and MAS-versus-spend movement. Business-unit peer movement identifies shared demand; channel spend share captures mix changes. Missingness and history stop sparse iROAS or cold start from becoming false evidence.
-- **Classification flow.** Observable features are checked for leakage before seven binary targets are attached. Event IDs define five grouped folds, keeping connected months together. Each pipeline learns only from its training folds and scores the held-out fold. Performance metrics and ground-truth comparisons will be refreshed in Evaluation.
+Five causes use separate L2-regularized logistic regressions. Imputation and standardization are learned within each training fold, `class_weight='balanced'` addresses rarity, and `C=0.1` is fixed in advance. `mix_shift_artifact` and `external_demand_spike` use rules because each has only one independent event.
 
-## Feature engineering
+This hybrid avoids forcing co-occurring causes into one probability distribution. Its outputs are uncalibrated ranking scores, not probabilities. XGBoost is deferred because 23 labeled event groups cannot show whether its extra capacity would generalize or merely memorize events.
 
-The pipeline creates **60 observable features** before opening either ground-truth file. This boundary prevents injected labels from influencing feature availability or construction.
+## Evidence used for attribution
 
-- **Build the panel first.** For every business unit–brand–channel–month, each positive metric receives a robust log residual against its previous 12 months and one- and three-month log changes. The rolling window shifts by one month, so the current observation never enters its own baseline. Only after this step does the pipeline retain [Task 1 investigations][task-1-notebook] and attach their trigger flags and signed anomaly scores.
-- **Represent both outcomes and mechanisms.** ROAS, RROI, iROAS, MAS, and spend describe the reported outcome. CTR, CPC, PICR, and impression share distinguish engagement, cost, conversion, and delivery mechanisms. The ROAS–RROI wedge isolates reporting movement; iROAS–RROI agreement tests incremental corroboration; and MAS-versus-spend movement separates genuine growth from a denominator effect.
-- **Add time and business context.** Current residuals capture sudden changes, while one- and three-month changes capture direction and persistence. CTR and PICR also use residuals from `t-1` and `t-2` to distinguish a creative ramp from a one-month spike. Leave-one-out business-unit peer movement identifies shared demand, and current plus one- and three-month channel spend-share changes identify mix reallocation. Missingness and months of history tell the model when sparse iROAS or cold start makes the evidence less reliable.
+The pipeline creates 60 observable features before opening either ground-truth file. Features include prior-12-month residuals; one-month and three-month changes; lagged CTR and PICR; peer movement; and spend-share changes. The baseline shifts by one month so that an observation never enters its own baseline.
 
-**Signals and lag structure.** The table summarizes the dominant signal family and strongest individual evidence reported for each fitted cause.
+Grouped permutation tests measure the loss in precision-recall area under the curve (PR-AUC) when a signal block is shuffled in held-out data. Blocks matter more than individual columns because correlated lags can split credit. This ranks evidence after classification; all features remain in the models.
 
-| Cause | Dominant signal family | Strongest individual evidence | Timing and interpretation |
-|---|---|---|---|
-| Genuine efficiency gain | CTR | ROAS–RROI wedge | Current month; a larger wedge lowers the score, so the model looks for efficiency without a reporting disconnect. |
-| Spend reduction artifact | Impression share | Three-month impression-share change | `t-2` to `t`; a decline raises the score and indicates delivery was cut. |
-| Survivorship bias | Impression share | Current impression-share residual | `t`; a sharp negative residual is the strongest evidence of placements disappearing. |
-| Creative refresh | PICR | Two-month-lagged PICR residual | `t-2`; a positive residual captures the ramp preceding the flagged month. |
-| Measurement artifact | Cross-metric consistency | ROAS–RROI wedge | `t`; a larger positive wedge raises the score because ROAS moved without matching RROI. |
+| Cause | Main signal block (PR-AUC loss) | Strongest feature (loss) | Interpretation |
+|---|---:|---:|---|
+| Creative refresh | PICR (0.455) | `picr_resid_lag2` (0.257) | A positive residual two months earlier identifies the ramp. |
+| Survivorship bias | Impression share (0.433) | `impression_share_resid` (0.120) | A sharp current decline suggests that placements disappeared. |
+| Spend reduction artifact | Impression share (0.134) | `impression_share_d3` (0.075) | A sustained decline suggests that delivery was cut rather than improved. |
+| Genuine efficiency gain | CTR (0.132) | `wedge_roas_rroi` (0.062) | A negative wedge represents efficiency without a reporting disconnect. |
+| Measurement artifact | Cross-metric consistency (0.103) | `wedge_roas_rroi` (0.112) | A positive wedge means ROAS moved while RROI did not. |
 
-The two rule-scored causes use designed signals rather than learned importance. Mix shift uses one-month spend-share reallocation without matching CTR or PICR improvement, while external demand uses current leave-one-out peer movement.
+Each fitted cause relies most on the expected signal block. Genuine efficiency is less conclusive: with only 12 positive rows, the model partly learns the absence of a ROAS-RROI reporting wedge. These values are ranking losses, not causal effect sizes.
 
-## Evaluation
+## Analyst output
 
-Verified real-world cause labels do not exist, so evaluation separates scoring from label inspection. The pipeline fixes all observable features and out-of-fold scores before opening the hidden synthetic labels. These labels test whether the model recovers mechanisms built into the simulator; they do not prove that the same relationships are causal in live campaigns.
+Each investigation produces a short narrative card:
 
-- **Out-of-fold scoring and output.** [Section 6 of the Task 2 attribution notebook][task-2-notebook] fits five L2-regularized logistic regressions in event-grouped folds and scores the two scarce causes with expert rules. No event group appears in both training and validation. Each investigation receives seven independent cause scores, their model-or-rule source, ranked causes above the 0.30 threshold, and an abstention status. Scores do not need to sum to one because causes can co-occur.
-- **Metrics and baselines.** PR-AUC is primary because each cause appears in only 2–10% of candidates; it measures how well true cases concentrate near the top of the ranking. ROC-AUC provides secondary ranking context, while Brier score and log loss expose unreliable score magnitudes and confident errors. Precision describes analyst queue quality, and recall describes cause coverage at the operating threshold. Logistic regression reaches macro PR-AUC **0.468**, compared with **0.341** for deterministic expert signatures and **0.036** for a prevalence-only baseline, and beats the rules on three of five fitted causes.
-- **Feature-evidence validation.** [Section 8 of the Task 2 attribution notebook][task-2-notebook] keeps all 60 features in the fitted models and ranks evidence after classification; it does not select features and refit. Grouped permutation importance shuffles related blocks in held-out folds and measures the drop in PR-AUC, then repeats the test for individual columns. Standardized coefficients provide direction. Block results carry more weight because correlated lags can split credit across columns. Creative refresh has the strongest PICR evidence: the block reduces held-out PR-AUC by 0.455 when shuffled, led by the positive `t-2` PICR residual at 0.257. Survivorship similarly depends on falling impression share, with block and current-residual drops of 0.433 and 0.120. Measurement artifact uses the expected current ROAS–RROI wedge at 0.112, while spend reduction uses the expected three-month impression-share decline at 0.075. Genuine efficiency is less conclusive: CTR is its leading block at 0.132, but its strongest individual feature is the absence of a ROAS–RROI wedge at 0.062. With only 12 positive rows, the model partly learns what this cause is not. These values measure held-out ranking loss, not causal effect size.
-- **Decision threshold and abstention.** At 0.30, creative refresh finds 27 of 28 cases with 0.519 precision, while survivorship bias reaches 0.650 precision and 0.867 recall; mix shift and external demand remain weak because they use sparse rule evidence. The policy abstains on 56.0% of investigations, and 88.9% of those abstentions contain no injected cause. The threshold is therefore a workload control: lowering it finds more causes but creates more reviews, while raising it produces a smaller, less complete queue.
-- **Worked case and calibration.** For `Snacks / CrispBite / display / 2023-01`, the system correctly identifies all three injected causes—creative refresh, spend reduction, and survivorship bias—but also proposes genuine efficiency and measurement artifact. The result is three hits, two false alarms, and two correct rejections, illustrating how co-occurring mechanisms create observational overlap. Reliability curves show that class balancing inflates score levels, so the output says **“ranked highest for”**, not **“70% probability.”** With only 11–28 positive examples per fitted cause, post-hoc calibration would be unstable; reviewed analyst labels are required before deployment claims can replace synthetic validation.
+> **{Business unit} / {brand} / {channel} / {month}:** The observed pattern is most consistent with **{top cause} ({score})** under the synthetic training distribution. The largest contributing signals are {top three signed contributions}. The second-ranked cause is **{runner-up} ({score})**. This is diagnostic evidence, not proof of cause.
 
-## Causal honesty
+If no score clears the threshold, the card reports the highest score and routes the investigation to manual review. Signed feature contributions let the analyst check the evidence before accepting or revising the explanation. For example, the `Snacks / CrispBite / display / 2023-01` card ranks survivorship bias first and identifies falling impression share as the dominant signal; its 1.00 score is not 100% confidence.
 
-Only one of the five fitted causes, `creative_refresh`, is the top scorer on its own positive rows. On true `survivorship_bias` rows the `spend_reduction_artifact` model scores higher, 0.813 against 0.799, and `measurement_artifact` ranks fourth of five on its own. Per-cause PR-AUC therefore overstates how much of the signal is cause-specific; a large share is a shared "something moved" component that the [attribution notebook][task-2-notebook] measures directly.
+## Evaluation and decision readiness
 
-That finding sets the honesty boundary. The simulator supplies causal ground truth only because its mechanisms were injected. The model learns associations between observable patterns and those labels and estimates no effect of spend, creative, or engagement on business outcomes. Nothing was randomized or withheld, so the counterfactual is never observed, and iROAS is corroborating evidence rather than a causal warrant.
+Verified real-world cause labels do not exist. The pipeline fixes features and out-of-fold scores before opening the synthetic labels, which tests simulator recovery rather than performance in live campaigns.
 
-Selection compounds this. Only 106 of 254 true anomaly rows survive [Task 1][task-1-notebook] and reach attribution, so 58% of real anomalies are invisible to the model and 12 of 37 events never surface a candidate row. Every score is conditional on the detector version.
+- **Validation and baselines.** Grouped five-fold validation has zero event-group leakage. Logistic regression reaches a macro PR-AUC of **0.468**, compared with **0.341** for expert signatures and **0.036** for prevalence alone. It beats the rules on three fitted causes but loses on spend reduction and measurement artifact, supporting a hybrid rather than complete model replacement.
+- **Threshold and abstention.** At 0.30, creative refresh finds 27 of 28 cases at 0.519 precision; survivorship reaches 0.650 precision and 0.867 recall. Of abstained investigations, 88.9% contain no injected cause, compared with 37.6% of proposed cases. Raising the threshold from 0.20 to 0.50 reduces the reviewed share from 60% to 25%.
+- **Calibration.** Class balancing inflates scores, so the output uses ranking rather than probability language. With only 11 to 28 positive examples per fitted cause, calibration would fit noise. Creative refresh's 0.876 PR-AUC reflects direct CTR and PICR changes in the generator and should not be expected in production.
 
-Output wording follows. A case is described as most consistent with a cause under the synthetic training distribution, its supporting signals are listed, and no proof is claimed. Overlapping scores are expected. Weak or conflicting evidence produces `insufficient_evidence` and manual review, never an autonomous budget action.
+## Causal limits
 
-## Productionisation
+The system distinguishes genuine improvements from artifacts only when their observable signatures differ. `creative_refresh` is the only fitted cause that ranks first on its own positive rows. On true `survivorship_bias` rows, spend reduction scores 0.813, compared with 0.799 for survivorship, while `measurement_artifact` ranks fourth of five. Cause-level PR-AUC therefore overstates specificity because the models share a broad “something changed” signal.
 
-In practice, the system runs after the monthly reporting close. [Task 1][task-1-notebook] creates the investigation queue, and [Task 2][task-2-notebook] returns ranked causes, supporting signals, and an abstention status. Analysts confirm or reject the suggestions, record an unknown cause where needed, and retain ownership of the final narrative.
+The models learn associations from injected causes; they do not estimate the effects of spend, creative, or engagement. No intervention was randomized, and no counterfactual was observed. Only 106 of 254 true anomaly rows reach attribution, and 12 of 37 events never produce a candidate, so every score is conditional on the detector.
 
-- **Retraining with scarce labels.** The scarce unit is an independent confirmed event, not another alert row from the same event. The full synthetic panel contains 37 events across 48 months: `37 ÷ 48 × 12 = 9.2` events per year. The benchmark of 100 confirmed events is not a sample-size calculation; it is a round-number stress test showing how long even a modest three-digit validation set would take to build. Using all 37 events gives 130 months, or about 11 years. That is optimistic because only 25 of the 37 events reach Task 2; at that observed rate, the same benchmark is closer to 16 years. The model therefore remains synthetically pretrained, while analyst decisions build a separate validation and calibration set. Unreviewed alerts remain unlabeled; treating them as negatives would teach the model about analyst capacity rather than causes.
-- **Retraining cadence.** The team reviews the model annually and refits it when drift is confirmed or the simulator's assumptions change. Annual review is a governance choice, not an optimized statistical interval. Monthly refitting would add false precision because, after overlapping events are grouped together for validation, the [Task 2 training set contains only 23 independent labeled event groups][task-2-notebook].
-- **Monitoring.** The starting baselines come directly from the [Task 2 notebook run][task-2-notebook]: 466 investigations across 48 months gives **9.7 per month**; 261 of 466 investigations abstain, giving **56%**; and the engineered iROAS feature block has **11.8%** mean missingness. Production monitoring compares future alert volume, abstention, missingness, cause-score prevalence, feature distributions, and coefficient signs with these baselines. A sustained rise in abstention is particularly important because it suggests that the seven-cause taxonomy no longer explains what analysts are seeing.
-- **Cold start.** Four of the 42 synthetic series have less than 12 months of history. The 12-month threshold comes from the [Task 1 history policy][task-1-notebook], while the robust residual also requires at least 9 valid observations in that trailing window—the 75% coverage rule. Until a new brand clears both conditions, it uses pooled business-unit and channel baselines, expert rules, and a low-confidence manual-review state. Once enough history exists, the shared model can score its normalized behavior and peer context without fitting a separate brand model.
+The output must therefore describe evidence as “most consistent with” a cause and avoid claims of proof. Weak or conflicting evidence produces `insufficient_evidence` and manual review, never an autonomous budget action.
 
-## Limits
+## Production plan
 
-The model can prioritize investigations, but it cannot turn monthly correlations into proof.
+The workflow runs after the monthly close and before report circulation. Stage 1 creates the queue, Stage 2 returns ranked causes and evidence, and the narrative card gives the analyst a starting point. Analysts retain ownership of the final explanation.
 
-- **Some causes remain indistinguishable.** Monthly data cannot reliably separate survivorship from spend reduction, or creative refresh from genuine efficiency at onset. These problems need placement-retention records and creative launch dates, not simply more rows.
-- **Some causes have too little evidence.** Mix shift and external demand have one event each, while measurement artifact has 11 positive rows. More independent panels would improve stability; reviewed cases are still needed to test whether synthetic patterns transfer to real campaigns.
-- **Coverage and confidence remain limited.** Scores rank explanations; they are not probabilities. Attribution also inherits the 58% of true anomaly rows missed by [Task 1][task-1-notebook], while an unseen cause may abstain or resemble the wrong known cause.
-- **Better data matters most.** Priorities are placement and creative records, planned budgets, measurement-change logs, demand controls, and incrementality tests. Next steps are more independent panels, fitting the two rule-scored causes, unweighted calibration, and only then comparison with shallow XGBoost.
+- **Learning from scarce labels.** The scarce unit is an independently confirmed event, not another row from the same event. The panel yields 9.2 events per year, and only 25 of 37 reach Stage 2, so a 100-event validation set would take 11 to 16 years. The model remains synthetically pretrained while analyst decisions build a separate validation and calibration set. Unreviewed alerts remain unlabeled.
+- **Review cadence.** The team reviews the system annually and refits it after confirmed drift or changed simulator assumptions. Monthly refitting on 23 labeled event groups would create false precision.
+- **Monitoring.** Initial baselines are 9.7 investigations per month, 56% abstention, and 11.8% missingness in the iROAS feature block. Monitoring covers volume, abstention, missingness, cause prevalence, feature distributions, and coefficient signs. Rising abstention can indicate an incomplete cause taxonomy.
+- **Cold start.** Four of 42 series have less than 12 months of history. Until a brand has 12 months of history and meets the 75%-valid-observation requirement, it uses pooled baselines, expert rules, and manual review. It can then use the shared model without a separate brand model.
 
-[task-1-notebook]: anomaly_detection/anomaly_detection.ipynb
-[task-2-notebook]: attribution/attribution.ipynb
+## Limits and next steps
+
+- Monthly data cannot reliably separate survivorship from spend reduction or creative refresh from genuine efficiency at onset. Placement-retention and creative-launch records would provide the missing evidence.
+- Mix shift and external demand have only one event each, while measurement artifact has 11 positive rows.
+- Attribution inherits the 58% of true anomaly rows missed by Stage 1. An unknown cause might trigger abstention or resemble the wrong known cause.
+
+Next, generate 8 to 10 independent panels, reserve seed 42 as a test set, fit the rule-scored causes, evaluate calibration, and then compare a constrained XGBoost model. Also compare explicit deseasonalization with the trailing-MAD detector and derive movement sensitivity by metric.
+
+Operational data matters more than either modeling step. Placement and creative logs, planned budgets, measurement-change records, and incrementality tests are the clearest path toward causal evidence. Forecasting remains out of scope because the brief prioritizes detection and attribution.
+
+*Time spent: approximately 1.5 working days; see `README.md` for the breakdown.*

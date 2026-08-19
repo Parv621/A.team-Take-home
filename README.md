@@ -54,7 +54,7 @@ Approx 1.5 working days of effort.
 - Data Generation: 3 hours
 - Anomaly detection + understanding trends: 4 hours
 - Attribution analysis: 4 hours
-- Report writng, edits and publishing: 3 hours
+- Report writing, edits and publishing: 3 hours
 
 ## Reproducibility note
 

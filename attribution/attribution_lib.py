@@ -99,7 +99,15 @@ def robust_z(pct_change, win):
 
 
 def business_floors(bm, metrics=ALL_PRIMARY):
-    """75th percentile of each metric's own |month-over-month| change -- Task 1's per-metric floor."""
+    """75th percentile of each metric's own |month-over-month| change -- Task 1's per-metric floor.
+
+    NOTE: Task 1's notebook rounds this to the nearest whole percent before thresholding; this returns
+    the unrounded value. A handful of rows sit between the two, so flag counts here run 1-2 above
+    Task 1's on ROAS, iROAS and spend (153/67/204 vs 151/66/203) and match exactly on RROI and MAS.
+    Both print as `15% / 14% / 37% / 22% / 24%`, so the gap is invisible from the printout. Four extra
+    candidates out of 466 changes nothing downstream; the delta is documented in the notebook rather
+    than silently absorbed. Round here to make the two paths identical.
+    """
     out = {}
     for m in metrics:
         mom = bm.groupby(KEY[:3])[m].pct_change(fill_method=None).dropna()
